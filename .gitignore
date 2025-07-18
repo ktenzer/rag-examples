@@ -1,0 +1,6 @@
+__pycache__
+chroma_db
+docs
+.DS_Store
+.env
+poetry.lock
