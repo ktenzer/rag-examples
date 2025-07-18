@@ -1,4 +1,8 @@
 # rag-examples
+Local RAG pipeline that embeds a folder of documents, stores them in Chroma, and chats via ChatGPT or webAI
+
+## Add Documents
+Add pdf files under directory called docs
 
 ## Install Dependencies
 ```bash
