@@ -27,16 +27,15 @@ oa = OpenAI(base_url=base_url, api_key=api_key)
 DOCS_DIR   = pathlib.Path("./docs").resolve()
 CHROMA_DIR = pathlib.Path("./chroma_db/webai")
 
-EMB_MODEL_NAME = "BAAI/bge-small-en-v1.5"    # ≈150 MB
+EMB_MODEL_NAME = "BAAI/bge-small-en-v1.5"    # 150 MB
 CHAT_MODEL     = "webai"            # whatever WebAI exposes
 
 K_RETRIEVE    = 4
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 80
 
-# Embedding wrapper for Chroma
+# Embedding wrapper for Chroma (cpu-only using sentence transformers)
 class HFEmbedding(EmbeddingFunction):
-    """CPU‑only embedding using sentence‑transformers."""
     def __init__(self, model_name: str):
         self.model = SentenceTransformer(model_name, device="cpu")
         self._dims = self.model.get_sentence_embedding_dimension()

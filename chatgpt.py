@@ -19,7 +19,7 @@ K_RETRIEVE    = 4
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 80
 
-# Helper
+# Helpers
 def load_documents() -> List[str]:
     loaders = [
         DirectoryLoader(str(DOCS_DIR), glob="**/*.txt", loader_cls=TextLoader),
