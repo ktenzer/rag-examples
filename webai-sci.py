@@ -59,31 +59,14 @@ print("Models ready\n")
 # Embeddings
 class SciEmbedding(EmbeddingFunction):
     def __init__(self):
-        # local fallback encoder (already loaded earlier)
-        self.fallback_model = SentenceTransformer("intfloat/e5-base-v2", device="cpu")
-        self.openai_client  = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = SentenceTransformer("BAAI/bge-large-en-v1.5", device="cpu")
+        self.dim   = self.model.get_sentence_embedding_dimension()
 
-    def name(self): return "adaptive-openai-or-e5"
-    def dimensions(self): return 768
-
-    def _mean_pool_3072_to_768(self, vec: List[float]) -> List[float]:
-        # simple 4‑way mean pooling
-        import numpy as np
-        arr = np.array(vec).reshape(4, 768)
-        return arr.mean(axis=0).tolist()
+    def name(self): return "bge-large-en-v1.5"
+    def dimensions(self): return self.dim
 
     def __call__(self, texts):
-        try:
-            res = self.openai_client.embeddings.create(
-                model="text-embedding-3-large",
-                input=texts,
-                encoding_format="float"
-            )
-            pooled = [self._mean_pool_3072_to_768(d.embedding) for d in res.data]
-            return pooled
-        except Exception as e:
-            print(f"[embeddings] Falling back to E5 {e}")
-            return self.fallback_model.encode(texts, convert_to_numpy=True).tolist()
+        return self.model.encode(texts, convert_to_numpy=True).tolist()
 
 class CLIPTextEF(EmbeddingFunction):
     def __init__(self): self.proc, self.model = clip_proc, clip_model
@@ -270,71 +253,100 @@ def rerank(query: str, docs: List[str], metas: List[dict], keep=4):
     best   = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:keep]
     return [docs[i] for i in best], [metas[i] for i in best]
 
-# Chat loop
-def chat():
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR), settings=Settings(anonymized_telemetry=False))
-    txt_col, img_col = open_if_exists(client)
+# Main
+def main():
+    # Persistent Chroma client
+    client = chromadb.PersistentClient(
+        path=str(CHROMA_DIR),
+        settings=Settings(anonymized_telemetry=False)
+    )
 
-    if txt_col and img_col and txt_col.count() and img_col.count():
-        print("Found existing Chroma DB – skipping ingestion\n")
+    # Text collection
+    try:
+        txt_col = client.get_collection("text", embedding_function=SciEmbedding())
+    except Exception:
+        txt_col = None
+
+    # If text vectors exist, we assume the DB is already built
+    if txt_col and txt_col.count() > 0:
+        print(f"Found existing Chroma DB ({txt_col.count()} text vectors) – skipping ingest\n")
+
+        try:
+            img_col = client.get_collection("images", embedding_function=clip_text_ef)
+        except Exception:
+            img_col = client.get_or_create_collection("images", embedding_function=clip_text_ef)
+
     else:
-        print("Scanning ./docs …")
+        # No usable vectors, build everything from scratch
+        print("No text vectors detected running full ingest (OCR, chunk, embed) …")
         text_docs, image_docs, img_docs = load_docs()
-        chunks = md_split(text_docs)
+        chunks   = md_split(text_docs)
         txt_col, img_col = build_stores(chunks, img_docs, client)
 
-    corpus_docs  = txt_col.get()['documents']
-    corpus_metas = txt_col.get()['metadatas']
+    # Build BM25
+    corpus_docs  = txt_col.get()["documents"]
+    corpus_metas = txt_col.get()["metadatas"]
     bm25 = BM25Store([d.lower() for d in corpus_docs])
 
-    print("Ready - ask me anything (Ctrl‑C to quit)\n")
+    print("Ready: ask me anything (Ctrl‑C to quit)\n")
+
+    # Chat Loop
     while True:
         try:
             q = input("User: ").strip()
-            if not q: continue
+            if not q:
+                continue
 
-            # bi‑encoder recall
+            # Dense retrieval
             txt = txt_col.query(query_texts=[q], n_results=20)
             docs_vec, metas_vec = txt["documents"][0], txt["metadatas"][0]
 
-            # BM25 recall
-            docs_bm  = [corpus_docs[i]  for i in bm25.query(q.lower(), k=10)]
-            metas_bm = [corpus_metas[i] for i in bm25.query(q.lower(), k=10)]
+            # BM25 lexical retrieval
+            idxs = bm25.query(q.lower(), k=10)
+            docs_bm  = [corpus_docs[i]  for i in idxs]
+            metas_bm = [corpus_metas[i] for i in idxs]
 
+            # Merge & cross‑encoder re‑rank
             docs_all  = docs_vec + docs_bm
             metas_all = metas_vec + metas_bm
             docs, metas = rerank(q, docs_all, metas_all, keep=4)
 
-            # CLIP image search
-            clip_vec = clip_text_ef([q])[0]
-            img = img_col.query(query_embeddings=[clip_vec], n_results=2)
-            docs  += img["documents"][0]
-            metas += img["metadatas"][0]
+            # CLIP image retrieval
+            if img_col.count() > 0:
+                clip_vec = clip_text_ef([q])[0]
+                img = img_col.query(query_embeddings=[clip_vec], n_results=2)
+                docs  += img["documents"][0]
+                metas += img["metadatas"][0]
 
-            # Show context
+            # Display context
             print("\n🔎 Retrieved context:")
-            for i,(d,m) in enumerate(zip(docs, metas),1):
+            for i, (d, m) in enumerate(zip(docs, metas), 1):
                 snippet = "<image>" if m.get("image_path") else shorten(d)
-                print(f"  {i}. {label(m,i)} — {snippet}")
+                print(f"  {i}. {label(m, i)} — {snippet}")
             print("")
 
-            blocks=[]
-            for i,(d,m) in enumerate(zip(docs, metas),1):
-                content = "<image at "+m['image_path']+">" if m.get("image_path") else d
-                blocks.append(f"{label(m,i)}\n{content}")
-            prompt = ("You are a helpful assistant. Use ONLY the sources below.\n\n"
-                      f"User question: {q}\n\n" + "\n\n".join(blocks) +
-                      "\n\nCite facts like (Source 2).")
+            # Build LLM prompt
+            blocks = []
+            for i, (d, m) in enumerate(zip(docs, metas), 1):
+                content = f"<image at {m['image_path']}>" if m.get("image_path") else d
+                blocks.append(f"{label(m, i)}\n{content}")
+
+            prompt = (
+                "You are a helpful assistant. Use ONLY the sources below.\n\n"
+                f"User question: {q}\n\n" + "\n\n".join(blocks) +
+                "\n\nCite facts like (Source 2)."
+            )
 
             ans = oa.chat.completions.create(
                 model="webai",
-                messages=[{"role":"user","content":prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             ).choices[0].message.content
             print("\nAssistant:", ans, "\n")
 
         except KeyboardInterrupt:
-            print("\nGood Bye"); break
+            print("\nGood Bye")
+            break
 
 if __name__ == "__main__":
-    chat()
+    main()
