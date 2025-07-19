@@ -2,7 +2,7 @@
 name        = "rag-examples"
 version     = "0.1.0"
 description = "Local RAG pipeline that embeds a folder of documents, stores them in Chroma, and chats via ChatGPT or webAI"
-authors     = ["<you>"]
+authors     = ["Keith Tenzer<keith.tenzer@webai.com>"]
 
 [tool.poetry.dependencies]
 python                    = "^3.12"

@@ -15,6 +15,10 @@ from PIL import Image
 from rank_bm25 import BM25Okapi
 from doctr.io import DocumentFile
 from doctr.models import ocr_predictor
+import numpy as np
+from sentence_transformers.util import cos_sim
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_community.docstore.document import Document
 
 # Env
 load_dotenv(override=True)
@@ -30,10 +34,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # Models
-TXT_EMBED_MODEL  = "text-embedding-3-large"
+TEXT_MODEL       = "BAAI/bge-large-en-v1.5"
 CLIP_MODEL       = "openai/clip-vit-base-patch32"
 BLIP_MODEL       = "Salesforce/blip-image-captioning-base"
-RERANK_MODEL     = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_MODEL     = "BAAI/bge-reranker-large"
 CHARTQA_MODEL    = "google/pix2struct-chartqa-base"
 
 print("Loading models …")
@@ -46,7 +50,7 @@ blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL)
 p2s_proc   = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL)
 p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL)
 
-reranker   = CrossEncoder(RERANK_MODEL)
+reranker   = CrossEncoder(RERANK_MODEL, device="cpu")
 
 ocr_model  = ocr_predictor(
                 pretrained=True,
@@ -59,7 +63,7 @@ print("Models ready\n")
 # Embeddings
 class SciEmbedding(EmbeddingFunction):
     def __init__(self):
-        self.model = SentenceTransformer("BAAI/bge-large-en-v1.5", device="cpu")
+        self.model = SentenceTransformer(TEXT_MODEL, device="cpu")
         self.dim   = self.model.get_sentence_embedding_dimension()
 
     def name(self): return "bge-large-en-v1.5"
@@ -77,6 +81,7 @@ class CLIPTextEF(EmbeddingFunction):
             inp = self.proc(text=texts, return_tensors="pt", padding=True)
             return self.model.get_text_features(**inp).cpu().numpy().tolist()
 
+embed_model = SentenceTransformer("BAAI/bge-large-en-v1.5", device="cpu")
 clip_text_ef = CLIPTextEF()
 
 def clip_embed_image(path: str):
@@ -110,9 +115,6 @@ def doctr_ocr(path: Path) -> str:
     )
 
 # Text splitters
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from langchain_community.docstore.document import Document
-
 def md_split(docs, chunk=800, overlap=80):
     header = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")])
     rc     = RecursiveCharacterTextSplitter(chunk_size=chunk, chunk_overlap=overlap)
@@ -230,6 +232,36 @@ def build_stores(txt_chunks, img_docs, client):
     print(f"Vector DB ready ({time.time()-t0:.1f}s)\n")
     return txt_col, img_col
 
+def mmr_select(query_emb, doc_embs, docs, metas, k=20, λ=0.6):
+    """
+    Max‑Marginal‑Relevance: pick k docs balancing relevance & diversity.
+    """
+    # ✱ ensure both arrays are float32
+    query_emb = np.asarray(query_emb, dtype=np.float32)
+    doc_embs  = np.asarray(doc_embs,  dtype=np.float32)
+
+    selected, sel_docs, sel_metas = [], [], []
+    candidates = list(range(len(docs)))
+
+    # ✱ tensors now share dtype=float32
+    sims_query = cos_sim(torch.tensor(query_emb), torch.tensor(doc_embs)).numpy().flatten()
+
+    while len(selected) < k and candidates:
+        if not selected:
+            idx = int(np.argmax(sims_query[candidates]))
+        else:
+            sims_selected = cos_sim(
+                torch.tensor(doc_embs[candidates]),
+                torch.tensor(doc_embs[selected])
+            ).numpy().max(axis=1)
+            mmr = λ * sims_query[candidates] - (1 - λ) * sims_selected
+            idx = candidates[int(np.argmax(mmr))]
+        selected.append(idx)
+        sel_docs.append(docs[idx])
+        sel_metas.append(metas[idx])
+        candidates.remove(idx)
+    return sel_docs, sel_metas
+
 # BM25 Wrapper
 class BM25Store:
     def __init__(self, docs_lower: List[str]):
@@ -297,18 +329,27 @@ def main():
             if not q:
                 continue
 
-            # Dense retrieval
-            txt = txt_col.query(query_texts=[q], n_results=20)
-            docs_vec, metas_vec = txt["documents"][0], txt["metadatas"][0]
+            txt = txt_col.query(
+                query_texts=[q],
+                n_results=60,
+                include=['documents', 'metadatas', 'embeddings']
+            )
+            docs_raw   = txt["documents"][0]
+            metas_raw  = txt["metadatas"][0]
+            embs_raw   = np.array(txt["embeddings"][0])        
 
-            # BM25 lexical retrieval
+            # MMR diversity to pick 20 unique docs
+            query_emb = embed_model.encode(q, convert_to_numpy=True)
+            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=20, λ=0.6)
+
+            # BM25 lexical retrieval 
             idxs = bm25.query(q.lower(), k=10)
             docs_bm  = [corpus_docs[i]  for i in idxs]
             metas_bm = [corpus_metas[i] for i in idxs]
 
-            # Merge & cross‑encoder re‑rank
-            docs_all  = docs_vec + docs_bm
-            metas_all = metas_vec + metas_bm
+            # Merge & BGE cross‑rerank 
+            docs_all  = docs_mmr + docs_bm
+            metas_all = metas_mmr + metas_bm
             docs, metas = rerank(q, docs_all, metas_all, keep=4)
 
             # CLIP image retrieval
