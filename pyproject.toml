@@ -19,6 +19,14 @@ llama-index = "^0.12.49"
 langchain-openai = "^0.3.28"
 sentence-transformers = "^5.0.0"
 dotenv = "^0.9.9"
+transformers = "^4.53.2"
+unstructured = {extras = ["all-docs"], version = "^0.18.9"}
+pdfplumber = "^0.11.7"
+pillow = "^11.3.0"
+rank-bm25 = "^0.2.2"
+plotdigitizer = "^0.3.0"
+opencv-python-headless = "^4.12.0.88"
+pytesseract = "^0.3.13"
 
 [tool.poetry.group.dev.dependencies]
 ipython = "^8.25"
