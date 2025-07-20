@@ -30,6 +30,7 @@ if not BASE_URL or not API_KEY:
     sys.exit("ERROR: OPENAI_BASE_URL / OPENAI_API_KEY missing in .env")
 from openai import OpenAI
 oa = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+MAX_CHROMA_BATCH_SIZE = 5000  # Safe limit below 5461
 
 # Apple Silicon device
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -257,11 +258,17 @@ def build_stores(txt_chunks, img_docs, client):
     print("Embedding & writing to Chroma …")
     t0 = time.time()
     txt_col = client.get_or_create_collection("text", embedding_function=SciEmbedding())
-    txt_col.add(
-        documents=[d.page_content for d in txt_chunks],
-        metadatas=[d.metadata for d in txt_chunks],
-        ids=[f"t{idx}" for idx in range(len(txt_chunks))]
-    )
+
+    # Add text chunks in batches
+    for i in range(0, len(txt_chunks), MAX_CHROMA_BATCH_SIZE):
+        batch = txt_chunks[i:i+MAX_CHROMA_BATCH_SIZE]
+        txt_col.add(
+            documents=[d.page_content for d in batch],
+            metadatas=[d.metadata for d in batch],
+            ids=[f"t{i+j}" for j in range(len(batch))]
+        )
+
+    # Add image vectors if needed
     img_col = client.get_or_create_collection("images", embedding_function=clip_text_ef)
     if img_docs:
         vecs = [clip_embed_image(d.metadata["image_path"]) for d in img_docs]
@@ -271,8 +278,10 @@ def build_stores(txt_chunks, img_docs, client):
             embeddings=vecs,
             ids=[f"i{idx}" for idx in range(len(img_docs))]
         )
+
     print(f"Vector DB ready ({time.time()-t0:.1f}s)\n")
 
+    # Clean up temporary images
     tmp_img_path = Path("./tmp/images")
     if tmp_img_path.exists():
         shutil.rmtree(tmp_img_path)
