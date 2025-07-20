@@ -1,4 +1,4 @@
-import os, sys, time, textwrap, mimetypes, warnings, logging, csv, io, re, json
+import os, sys, time, textwrap, mimetypes, warnings, logging, csv, io, re, shutil
 from pathlib import Path
 from typing import List
 from dotenv import load_dotenv
@@ -19,6 +19,9 @@ import numpy as np
 from sentence_transformers.util import cos_sim
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_community.docstore.document import Document
+import fitz
+from unstructured.partition.auto import partition
+import pdfplumber
 
 # Env
 load_dotenv(override=True)
@@ -27,6 +30,10 @@ if not BASE_URL or not API_KEY:
     sys.exit("ERROR: OPENAI_BASE_URL / OPENAI_API_KEY missing in .env")
 from openai import OpenAI
 oa = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+# Apple Silicon device
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 # Ignore warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -40,7 +47,7 @@ BLIP_MODEL       = "Salesforce/blip-image-captioning-base"
 RERANK_MODEL     = "BAAI/bge-reranker-large"
 CHARTQA_MODEL    = "google/pix2struct-chartqa-base"
 
-print("Loading models …")
+print("Loading models…")
 clip_model = CLIPModel.from_pretrained(CLIP_MODEL)
 clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=False)
 
@@ -129,9 +136,6 @@ def md_split(docs, chunk=800, overlap=80):
     return out
 
 # PDF and Table loaders
-from unstructured.partition.auto import partition
-import pdfplumber
-
 DOCS_DIR   = Path("./docs").resolve()
 CHROMA_DIR = Path("./chroma_db/webai")
 
@@ -149,26 +153,64 @@ def csv_to_sentences(raw_csv: str, hdr: List[str]) -> List[str]:
 
 def tables_docs(path: Path) -> List[Document]:
     docs = []
-    with pdfplumber.open(str(path)) as pdf:
-        for page in pdf.pages:
-            for tbl in page.extract_tables():
-                hdr, *rows = tbl
-                hdr = ["" if c is None else str(c) for c in hdr]
+    img_dir = Path("./tmp/images")
+    img_dir.mkdir(parents=True, exist_ok=True)
 
-                # Markdown table
-                md = "| " + " | ".join(hdr) + " |\n" + "|---" * len(hdr) + "|\n"
-                for r in rows:
-                    md += "| " + " | ".join("" if c is None else str(c) for c in r) + " |\n"
-                docs.append(Document(page_content=md, metadata={"source": str(path), "table_md": True}))
+    try:
+        print(f"Extracting from {path.name}")
+        doc = fitz.open(str(path))
+        for i, page in enumerate(doc, start=1):
+            blocks = page.get_text("blocks")
+            table_like_blocks = []
+            normal_blocks = []
 
-                # JSON table
-                docs.append(Document(page_content=json.dumps({"headers": hdr, "rows": rows}, ensure_ascii=False),
-                                     metadata={"source": str(path), "table_json": True}))
+            for b in blocks:
+                text = b[4].strip()
+                if not text: continue
+                if "\t" in text or "|" in text or re.search(r"\d+\s+\d+", text):
+                    table_like_blocks.append(text)
+                else:
+                    normal_blocks.append(text)
 
-                # Row sentences
-                raw_csv = "\n".join([",".join(hdr)] + [",".join("" if c is None else str(c) for c in r) for r in rows])
-                for sent in csv_to_sentences(raw_csv, hdr):
-                    docs.append(Document(page_content=sent, metadata={"source": str(path), "table_row": True}))
+            for tb in table_like_blocks:
+                docs.append(Document(page_content=tb, metadata={
+                    "source": str(path),
+                    "page": i,
+                    "table_fitz": True
+                }))
+
+            raw_text = "\n".join(normal_blocks)
+            if raw_text.strip():
+                docs.append(Document(page_content=raw_text, metadata={
+                    "source": str(path),
+                    "page": i,
+                    "text_fitz": True
+                }))
+
+            # Extract images (figures, graphs, etc.)
+            image_list = page.get_images(full=True)
+            for img_index, img in enumerate(image_list, start=1):
+                xref = img[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    img_bytes = base_image["image"]
+                    img_ext = base_image["ext"]
+                    img_path = img_dir / f"{path.stem}_page{i}_img{img_index}.{img_ext}"
+                    with open(img_path, "wb") as f:
+                        f.write(img_bytes)
+
+                    # Empty placeholder, actual text will be derived via BLIP/ChartQA/OCR
+                    docs.append(Document(page_content="", metadata={
+                        "source": str(path),
+                        "page": i,
+                        "image_path": str(img_path),
+                        "extracted_figure": True
+                    }))
+                except Exception as e:
+                    print(f"Error extracting image {xref} on page {i}: {e}")
+
+    except Exception as e:
+        print(f"Failed to process {path.name} with PyMuPDF: {e}")
     return docs
 
 # Loader
@@ -201,7 +243,7 @@ def load_docs():
             text.append(Document(page_content=fp.read_text(), metadata={"source": str(fp)}))
 
     print(f"Loaded {len(text)} text docs & {len(images)} images\n")
-    return text, images, images 
+    return text, images 
 
 # Chroma DB Helpers
 def open_if_exists(client):
@@ -230,20 +272,23 @@ def build_stores(txt_chunks, img_docs, client):
             ids=[f"i{idx}" for idx in range(len(img_docs))]
         )
     print(f"Vector DB ready ({time.time()-t0:.1f}s)\n")
+
+    tmp_img_path = Path("./tmp/images")
+    if tmp_img_path.exists():
+        shutil.rmtree(tmp_img_path)
+        print("🧹 Cleaned up temporary images\n")
+
     return txt_col, img_col
 
-def mmr_select(query_emb, doc_embs, docs, metas, k=20, λ=0.6):
-    """
-    Max‑Marginal‑Relevance: pick k docs balancing relevance & diversity.
-    """
-    # ✱ ensure both arrays are float32
+def mmr_select(query_emb, doc_embs, docs, metas, k=20, weight=0.6):
+    # ensure both arrays are float32
     query_emb = np.asarray(query_emb, dtype=np.float32)
     doc_embs  = np.asarray(doc_embs,  dtype=np.float32)
 
     selected, sel_docs, sel_metas = [], [], []
     candidates = list(range(len(docs)))
 
-    # ✱ tensors now share dtype=float32
+    # tensors now share dtype=float32
     sims_query = cos_sim(torch.tensor(query_emb), torch.tensor(doc_embs)).numpy().flatten()
 
     while len(selected) < k and candidates:
@@ -254,7 +299,7 @@ def mmr_select(query_emb, doc_embs, docs, metas, k=20, λ=0.6):
                 torch.tensor(doc_embs[candidates]),
                 torch.tensor(doc_embs[selected])
             ).numpy().max(axis=1)
-            mmr = λ * sims_query[candidates] - (1 - λ) * sims_selected
+            mmr = weight * sims_query[candidates] - (1 - weight) * sims_selected
             idx = candidates[int(np.argmax(mmr))]
         selected.append(idx)
         sel_docs.append(docs[idx])
@@ -311,7 +356,7 @@ def main():
     else:
         # No usable vectors, build everything from scratch
         print("No text vectors detected running full ingest (OCR, chunk, embed) …")
-        text_docs, image_docs, img_docs = load_docs()
+        text_docs, img_docs = load_docs()
         chunks   = md_split(text_docs)
         txt_col, img_col = build_stores(chunks, img_docs, client)
 
@@ -340,7 +385,7 @@ def main():
 
             # MMR diversity to pick 20 unique docs
             query_emb = embed_model.encode(q, convert_to_numpy=True)
-            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=20, λ=0.6)
+            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=20, weight=0.6)
 
             # BM25 lexical retrieval 
             idxs = bm25.query(q.lower(), k=10)

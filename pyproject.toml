@@ -27,6 +27,7 @@ rank-bm25 = "^0.2.2"
 plotdigitizer = "^0.3.0"
 opencv-python-headless = "^4.12.0.88"
 pytesseract = "^0.3.13"
+pymupdf = "^1.26.3"
 
 [tool.poetry.group.dev.dependencies]
 ipython = "^8.25"
