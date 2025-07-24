@@ -22,6 +22,7 @@ from langchain_community.docstore.document import Document
 from openai import OpenAI
 from unstructured.partition.auto import partition
 import pdfplumber
+from transformers import Pix2StructProcessor, Pix2StructForConditionalGeneration
 
 
 # Env
@@ -41,11 +42,11 @@ DOCS_DIR   = Path("./docs").resolve()
 CHROMA_DIR = Path("./chroma_db/webai")
 
 # Models
-TEXT_MODEL       = "BAAI/bge-large-en-v1.5"
-CLIP_MODEL       = "openai/clip-vit-base-patch32"
-BLIP_MODEL       = "Salesforce/blip-image-captioning-base"
-RERANK_MODEL     = "BAAI/bge-reranker-large"
-CHARTQA_MODEL    = "google/pix2struct-chartqa-base"
+TEXT_MODEL    = "BAAI/bge-base-en-v1.5"          
+RERANK_MODEL  = "BAAI/bge-reranker-base"          
+CLIP_MODEL    = "openai/clip-vit-base-patch32"    
+BLIP_MODEL = "Salesforce/blip-image-captioning-base"
+CHARTQA_MODEL = "google/deplot"   
 
 # Retrieval Settings
 TOP_K_MMR = 40
@@ -64,8 +65,8 @@ clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
 blip_proc  = BlipProcessor.from_pretrained(BLIP_MODEL)
 blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL).to(device)
 
-p2s_proc   = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL)
-p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL).to(device)
+p2s_proc  = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL)
+p2s_model = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL).to(device)
 
 reranker = CrossEncoder(RERANK_MODEL, device=device)
 
@@ -125,13 +126,12 @@ def blip_caption(path: Path, device=None) -> str:
     return blip_proc.decode(out[0], skip_special_tokens=True)
 
 def chartqa_caption(path: Path, device=None) -> str:
+    device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
     img = Image.open(path).convert("RGB")
-    inputs = p2s_proc(images=img, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    p2s_model.to(device)
+    inputs = p2s_proc(images=img, return_tensors="pt").to(device)
     with torch.no_grad():
         out = p2s_model.generate(**inputs, max_new_tokens=64)
-    return p2s_proc.decode(out[0], skip_special_tokens=True)
+    return p2s_proc.decode(out[0], skip_special_tokens=True).strip()
 
 def doctr_ocr(path: Path) -> str:
     doc = DocumentFile.from_images(str(path))

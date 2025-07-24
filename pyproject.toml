@@ -19,7 +19,7 @@ llama-index = "^0.12.49"
 langchain-openai = "^0.3.28"
 sentence-transformers = "^5.0.0"
 dotenv = "^0.9.9"
-transformers = "^4.53.2"
+transformers = {version = ">=4.41.0", extras = ["vision"]}
 unstructured = {extras = ["all-docs"], version = "^0.18.9"}
 pdfplumber = "^0.11.7"
 pillow = "^11.3.0"
