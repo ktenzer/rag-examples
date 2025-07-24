@@ -19,19 +19,26 @@ import numpy as np
 from sentence_transformers.util import cos_sim
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_community.docstore.document import Document
+from openai import OpenAI
+from unstructured.partition.auto import partition
+import pdfplumber
+
 
 # Env
 load_dotenv(override=True)
 BASE_URL, API_KEY = os.getenv("OPENAI_BASE_URL"), os.getenv("OPENAI_API_KEY")
+
 if not BASE_URL or not API_KEY:
     sys.exit("ERROR: OPENAI_BASE_URL / OPENAI_API_KEY missing in .env")
-from openai import OpenAI
 oa = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
 # Ignore warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+DOCS_DIR   = Path("./docs").resolve()
+CHROMA_DIR = Path("./chroma_db/webai")
 
 # Models
 TEXT_MODEL       = "BAAI/bge-large-en-v1.5"
@@ -40,17 +47,27 @@ BLIP_MODEL       = "Salesforce/blip-image-captioning-base"
 RERANK_MODEL     = "BAAI/bge-reranker-large"
 CHARTQA_MODEL    = "google/pix2struct-chartqa-base"
 
+# Retrieval Settings
+TOP_K_MMR = 40
+TOP_K_BM25 = 10
+TOP_K_IMAGE = 2
+TOP_K_RERANK = 4
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+
 print("Loading models …")
-clip_model = CLIPModel.from_pretrained(CLIP_MODEL)
-clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=False)
+embed_model = SentenceTransformer(TEXT_MODEL, device=device)
+
+clip_model = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
+clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
 
 blip_proc  = BlipProcessor.from_pretrained(BLIP_MODEL)
-blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL)
+blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL).to(device)
 
 p2s_proc   = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL)
-p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL)
+p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL).to(device)
 
-reranker   = CrossEncoder(RERANK_MODEL, device="cpu")
+reranker = CrossEncoder(RERANK_MODEL, device=device)
 
 ocr_model  = ocr_predictor(
                 pretrained=True,
@@ -63,7 +80,7 @@ print("Models ready\n")
 # Embeddings
 class SciEmbedding(EmbeddingFunction):
     def __init__(self):
-        self.model = SentenceTransformer(TEXT_MODEL, device="cpu")
+        self.model = SentenceTransformer(TEXT_MODEL, device=device)
         self.dim   = self.model.get_sentence_embedding_dimension()
 
     def name(self): return "bge-large-en-v1.5"
@@ -73,32 +90,45 @@ class SciEmbedding(EmbeddingFunction):
         return self.model.encode(texts, convert_to_numpy=True).tolist()
 
 class CLIPTextEF(EmbeddingFunction):
-    def __init__(self): self.proc, self.model = clip_proc, clip_model
+    def __init__(self):
+        self.proc, self.model = clip_proc, clip_model
+
     def name(self): return f"clip-text-{CLIP_MODEL}"
     def dimensions(self): return 512
+
     def __call__(self, texts):
         with torch.no_grad():
             inp = self.proc(text=texts, return_tensors="pt", padding=True)
+            inp = {k: v.to(device) for k, v in inp.items()} 
+            self.model.to(device)
             return self.model.get_text_features(**inp).cpu().numpy().tolist()
-
-embed_model = SentenceTransformer("BAAI/bge-large-en-v1.5", device="cpu")
+        
 clip_text_ef = CLIPTextEF()
 
-def clip_embed_image(path: str):
+# CLIP
+def clip_embed_image(path: str, device=None):
     with torch.no_grad():
         x = clip_proc(images=Image.open(path), return_tensors="pt")
-        return clip_model.get_image_features(**x)[0].cpu().numpy().tolist()
+        x = {k: v.to(device) for k, v in x.items()}  
+        clip_model.to(device) 
+        feats = clip_model.get_image_features(**x)
+    return feats[0].cpu().numpy().tolist()
 
 # OCR / Caption
-def blip_caption(path: Path) -> str:
+def blip_caption(path: Path, device=None) -> str:
     img = Image.open(path).convert("RGB")
+    inputs = blip_proc(images=img, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    blip_model.to(device)
     with torch.no_grad():
-        out = blip_model.generate(**blip_proc(images=img, return_tensors="pt"), max_new_tokens=40)
+        out = blip_model.generate(**inputs, max_new_tokens=40)
     return blip_proc.decode(out[0], skip_special_tokens=True)
 
-def chartqa_caption(path: Path) -> str:
+def chartqa_caption(path: Path, device=None) -> str:
     img = Image.open(path).convert("RGB")
     inputs = p2s_proc(images=img, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    p2s_model.to(device)
     with torch.no_grad():
         out = p2s_model.generate(**inputs, max_new_tokens=64)
     return p2s_proc.decode(out[0], skip_special_tokens=True)
@@ -129,12 +159,6 @@ def md_split(docs, chunk=800, overlap=80):
     return out
 
 # PDF and Table loaders
-from unstructured.partition.auto import partition
-import pdfplumber
-
-DOCS_DIR   = Path("./docs").resolve()
-CHROMA_DIR = Path("./chroma_db/webai")
-
 def ocr_pdf(path: Path):
     print(f"OCR {path.name}")
     elems = partition(filename=str(path), strategy="hi_res", languages=["eng"])
@@ -172,9 +196,9 @@ def tables_docs(path: Path) -> List[Document]:
                         for sent in csv_to_sentences(raw_csv, hdr):
                             docs.append(Document(page_content=sent, metadata={"source": str(path), "page": page_num, "table_row": True}))
                 except Exception as e:
-                    print(f"  ⚠️ Skipping table extraction on {path.name} page {page_num}: {e}")
+                    print(f"Skipping table extraction on {path.name} page {page_num}: {e}")
     except Exception as e:
-        print(f"  ❌ Failed to open {path.name} with pdfplumber: {e}")
+        print(f"Failed to open {path.name} with pdfplumber: {e}")
     return docs
 
 # Loader
@@ -207,7 +231,7 @@ def load_docs():
             text.append(Document(page_content=fp.read_text(), metadata={"source": str(fp)}))
 
     print(f"Loaded {len(text)} text docs & {len(images)} images\n")
-    return text, images, images 
+    return text, images 
 
 # Chroma DB Helpers
 def open_if_exists(client):
@@ -238,7 +262,7 @@ def build_stores(txt_chunks, img_docs, client):
     print(f"Vector DB ready ({time.time()-t0:.1f}s)\n")
     return txt_col, img_col
 
-def mmr_select(query_emb, doc_embs, docs, metas, k=20, λ=0.6):
+def mmr_select(query_emb, doc_embs, docs, metas, k=20, weight=0.6):
     """
     Max‑Marginal‑Relevance: pick k docs balancing relevance & diversity.
     """
@@ -260,7 +284,7 @@ def mmr_select(query_emb, doc_embs, docs, metas, k=20, λ=0.6):
                 torch.tensor(doc_embs[candidates]),
                 torch.tensor(doc_embs[selected])
             ).numpy().max(axis=1)
-            mmr = λ * sims_query[candidates] - (1 - λ) * sims_selected
+            mmr = weight * sims_query[candidates] - (1 - weight) * sims_selected
             idx = candidates[int(np.argmax(mmr))]
         selected.append(idx)
         sel_docs.append(docs[idx])
@@ -286,7 +310,7 @@ def label(meta, idx):
     flags = [k for k in ("table_md","table_json","table_row","chartqa","ocr") if meta.get(k)]
     return f"Source {idx}: {src}{' ('+'/'.join(flags)+')' if flags else ''}"
 
-def rerank(query: str, docs: List[str], metas: List[dict], keep=4):
+def rerank(query: str, docs: List[str], metas: List[dict], keep=TOP_K_RERANK):
     scores = reranker.predict([(query, d if d else " ") for d in docs])
     best   = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:keep]
     return [docs[i] for i in best], [metas[i] for i in best]
@@ -317,7 +341,7 @@ def main():
     else:
         # No usable vectors, build everything from scratch
         print("No text vectors detected running full ingest (OCR, chunk, embed) …")
-        text_docs, image_docs, img_docs = load_docs()
+        text_docs, img_docs = load_docs()
         chunks   = md_split(text_docs)
         txt_col, img_col = build_stores(chunks, img_docs, client)
 
@@ -346,7 +370,7 @@ def main():
 
             # MMR diversity to pick 20 unique docs
             query_emb = embed_model.encode(q, convert_to_numpy=True)
-            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=20, λ=0.6)
+            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=TOP_K_MMR, weight=0.6)
 
             # BM25 lexical retrieval 
             idxs = bm25.query(q.lower(), k=10)
@@ -356,12 +380,12 @@ def main():
             # Merge & BGE cross‑rerank 
             docs_all  = docs_mmr + docs_bm
             metas_all = metas_mmr + metas_bm
-            docs, metas = rerank(q, docs_all, metas_all, keep=4)
+            docs, metas = rerank(q, docs_all, metas_all, keep=TOP_K_BM25)
 
             # CLIP image retrieval
             if img_col.count() > 0:
                 clip_vec = clip_text_ef([q])[0]
-                img = img_col.query(query_embeddings=[clip_vec], n_results=2)
+                img = img_col.query(query_embeddings=[clip_vec], n_results=TOP_K_IMAGE)
                 docs  += img["documents"][0]
                 metas += img["metadatas"][0]
 
